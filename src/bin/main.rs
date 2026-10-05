@@ -16,6 +16,7 @@ use esp_radio::wifi::{
     AuthenticationMethodConfig, Config, ControllerConfig, Interface, WifiController,
     ap::AccessPointConfig, sta::StationConfig,
 };
+use smoltcp::wire::{EthernetAddress, EthernetFrame, EthernetProtocol, Ipv4Address, Ipv4Packet};
 
 extern crate alloc;
 
@@ -33,11 +34,23 @@ macro_rules! mk_static {
         x
     }};
 }
+
+struct Frame {
+    data: [u8; 1514],
+    len: usize,
+}
+
+enum Verdict {
+    Stack,
+    Nat,
+}
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const AP_SSID: &str = env!("AP_SSID");
+const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 2, 1);
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -73,7 +86,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let ap_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(Ipv4Addr::new(192, 168, 2, 1), 24),
-        gateway: Some(Ipv4Addr::new(192, 168, 2, 1)),
+        gateway: Some(AP_IP),
         dns_servers: Default::default(),
     });
 
@@ -112,7 +125,7 @@ async fn net_task(mut runner: Runner<'static, Interface>) {
 
 #[embassy_executor::task]
 async fn dhcp_server(stack: Stack<'static>) {
-    let ip = Ipv4Addr::new(192, 168, 2, 1);
+    let ip = AP_IP;
 
     // TODO 1: static buffer pool for the UDP sockets (edge_nal_embassy::UdpBuffers<N, TX, RX, META>)
     let buffers = mk_static!(UdpBuffers<1>, UdpBuffers::<1>::new());
@@ -185,5 +198,25 @@ async fn connection(mut controller: WifiController<'static>) {
                 Timer::after(Duration::from_millis(5000)).await
             }
         }
+    }
+}
+
+fn classify_packet(packet: &[u8]) -> Verdict {
+    // Frames we can't parse are left to the stack (it will drop them); never panic in the RX path.
+    let Ok(eth) = EthernetFrame::new_checked(packet) else {
+        return Verdict::Stack;
+    };
+    // Non-IPv4 (ARP, IPv6, ...) must reach the stack, e.g. ARP for 192.168.2.1.
+    if eth.ethertype() != EthernetProtocol::Ipv4 {
+        return Verdict::Stack;
+    }
+    let Ok(ip) = Ipv4Packet::new_checked(eth.payload()) else {
+        return Verdict::Stack;
+    };
+    let dst = ip.dst_addr();
+    if dst == AP_IP || dst.is_broadcast() || dst.is_multicast() || dst.is_unspecified() {
+        Verdict::Stack
+    } else {
+        Verdict::Nat
     }
 }
