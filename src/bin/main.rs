@@ -682,7 +682,16 @@ fn rewrite_inbound(frame: &mut [u8], ap_mac: EthernetAddress) -> bool {
         return false;
     };
     let nat_port = udp.dst_port();
-    let Some(entry) = NAT_TABLE.lock(|t| t.borrow().get(&nat_port).copied()) else {
+    let is_dns = udp.src_port() == 53;
+    let entry = NAT_TABLE.lock(|t| {
+        let mut t = t.borrow_mut();
+        if is_dns {
+            t.remove(&nat_port) // one query, one reply: free the slot
+        } else {
+            t.get(&nat_port).copied() // QUIC/TCP etc: many replies, keep the entry
+        }
+    });
+    let Some(entry) = entry else {
         return false;
     };
 
